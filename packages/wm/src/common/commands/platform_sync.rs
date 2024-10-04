@@ -32,7 +32,10 @@ pub fn platform_sync(
     state.focused_container().context("No focused container.")?;
 
   if state.pending_sync.cursor_jump {
-    jump_cursor(focused_container.clone(), state, config)?;
+    if config.value.general.cursor_jump.enabled {
+      jump_cursor(focused_container.clone(), state, config)?;
+    }
+
     state.pending_sync.cursor_jump = false;
   }
 
@@ -122,8 +125,9 @@ fn redraw_containers(state: &mut WmState) -> anyhow::Result<()> {
       },
     );
 
-    let rect =
-      window.to_rect()?.apply_delta(&window.total_border_delta()?);
+    let rect = window
+      .to_rect()?
+      .apply_delta(&window.total_border_delta()?, None);
 
     let is_visible = match window.display_state() {
       DisplayState::Showing | DisplayState::Shown => true,
