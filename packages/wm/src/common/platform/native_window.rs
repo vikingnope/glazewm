@@ -10,35 +10,46 @@ use windows::{
       DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DEFAULT, DWMWCP_DONOTROUND,
       DWMWCP_ROUND, DWMWCP_ROUNDSMALL,
     },
-    System::Threading::{
-      OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-      PROCESS_QUERY_LIMITED_INFORMATION,
+    System::{
+      Com::{CoCreateInstance, CLSCTX_SERVER},
+      Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+      },
     },
     UI::{
-      Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_MOUSE},
+      Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEINPUT,
+      },
+      Shell::{ITaskbarList, TaskbarList},
       WindowsAndMessaging::{
         EnumWindows, GetClassNameW, GetWindow, GetWindowLongPtrW,
         GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
         IsWindowVisible, IsZoomed, SendNotifyMessageW,
-        SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
-        ShowWindowAsync, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, HWND_NOTOPMOST,
-        HWND_TOPMOST, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
-        SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE,
+        SetForegroundWindow, SetWindowLongPtrW, SetWindowPlacement,
+        SetWindowPos, ShowWindowAsync, GWL_EXSTYLE, GWL_STYLE, GW_OWNER,
+        HWND_NOTOPMOST, HWND_TOPMOST, SWP_ASYNCWINDOWPOS,
+        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE,
         SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER,
-        SWP_SHOWWINDOW, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE,
-        SW_SHOWNA, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WS_CAPTION,
-        WS_CHILD, WS_DLGFRAME, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-        WS_MAXIMIZEBOX, WS_THICKFRAME,
+        SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWNA,
+        WINDOWPLACEMENT, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE,
+        WPF_ASYNCWINDOWPLACEMENT, WS_CAPTION, WS_CHILD, WS_DLGFRAME,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_THICKFRAME,
       },
     },
   },
 };
 
+use super::{iapplication_view_collection, iservice_provider, COM_INIT};
 use crate::{
   common::{Color, LengthValue, Memo, Rect, RectDelta},
-  user_config::CornerStyle,
+  user_config::{CornerStyle, HideMethod},
   windows::WindowState,
 };
+
+/// Magic number used to identify programmatic mouse inputs from our own
+/// process.
+pub const FOREGROUND_INPUT_IDENTIFIER: u32 = 6379;
 
 #[derive(Debug, Clone)]
 pub struct NativeWindow {
@@ -283,6 +294,12 @@ impl NativeWindow {
   pub fn set_foreground(&self) -> anyhow::Result<()> {
     let input = [INPUT {
       r#type: INPUT_MOUSE,
+      Anonymous: INPUT_0 {
+        mi: MOUSEINPUT {
+          dwExtraInfo: FOREGROUND_INPUT_IDENTIFIER as usize,
+          ..Default::default()
+        },
+      },
       ..Default::default()
     }];
 
@@ -484,8 +501,21 @@ impl NativeWindow {
     (current_style & style.0 as isize) != 0
   }
 
-  pub fn restore(&self) -> anyhow::Result<()> {
-    unsafe { ShowWindowAsync(HWND(self.handle), SW_RESTORE).ok() }?;
+  pub fn restore_to_position(&self, rect: &Rect) -> anyhow::Result<()> {
+    let placement = WINDOWPLACEMENT {
+      length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+      flags: WPF_ASYNCWINDOWPLACEMENT,
+      showCmd: SW_RESTORE.0 as u32,
+      rcNormalPosition: RECT {
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+      },
+      ..Default::default()
+    };
+
+    unsafe { SetWindowPlacement(HWND(self.handle), &placement) }?;
     Ok(())
   }
 
@@ -507,6 +537,23 @@ impl NativeWindow {
     Ok(())
   }
 
+  pub fn set_visible(
+    &self,
+    visible: bool,
+    hide_method: &HideMethod,
+  ) -> anyhow::Result<()> {
+    match hide_method {
+      HideMethod::Hide => {
+        if visible {
+          self.show()
+        } else {
+          self.hide()
+        }
+      }
+      HideMethod::Cloak => self.set_cloaked(!visible),
+    }
+  }
+
   pub fn show(&self) -> anyhow::Result<()> {
     unsafe { ShowWindowAsync(HWND(self.handle), SW_SHOWNA) }.ok()?;
     Ok(())
@@ -517,11 +564,54 @@ impl NativeWindow {
     Ok(())
   }
 
+  pub fn set_cloaked(&self, cloaked: bool) -> anyhow::Result<()> {
+    COM_INIT.with(|_| -> anyhow::Result<()> {
+      let view_collection =
+        iapplication_view_collection(&iservice_provider()?)?;
+
+      let mut view = None;
+      unsafe { view_collection.get_view_for_hwnd(self.handle, &mut view) }
+        .ok()?;
+
+      let view = view
+        .context("Unable to get application view by window handle.")?;
+
+      // Ref: https://github.com/Ciantic/AltTabAccessor/issues/1#issuecomment-1426877843
+      unsafe { view.set_cloak(1, if cloaked { 2 } else { 0 }) }
+        .ok()
+        .context("Failed to cloak window.")
+    })
+  }
+
+  /// Adds or removes the window from the native taskbar.
+  ///
+  /// Hidden windows (SW_HIDE) cannot be forced to be shown in the taskbar.
+  /// Cloaked windows are normally always shown in the taskbar, but can be
+  /// manually toggled.
+  pub fn set_taskbar_visibility(
+    &self,
+    visible: bool,
+  ) -> anyhow::Result<()> {
+    COM_INIT.with(|_| -> anyhow::Result<()> {
+      let taskbar_list: ITaskbarList =
+        unsafe { CoCreateInstance(&TaskbarList, None, CLSCTX_SERVER)? };
+
+      if visible {
+        unsafe { taskbar_list.AddTab(HWND(self.handle))? };
+      } else {
+        unsafe { taskbar_list.DeleteTab(HWND(self.handle))? };
+      }
+
+      Ok(())
+    })
+  }
+
   pub fn set_position(
     &self,
     state: &WindowState,
     rect: &Rect,
     is_visible: bool,
+    hide_method: &HideMethod,
     has_pending_dpi_adjustment: bool,
   ) -> anyhow::Result<()> {
     // Restore window if it's minimized/maximized and shouldn't be. This is
@@ -531,7 +621,9 @@ impl NativeWindow {
       // to non-maximized fullscreen.
       WindowState::Fullscreen(config) => {
         if !config.maximized && self.is_maximized()? {
-          self.restore()?;
+          // Restoring to position has the same effect as `ShowWindow` with
+          // `SW_RESTORE`, but doesn't cause a flicker.
+          self.restore_to_position(rect)?;
         }
       }
       // No need to restore window if it'll be minimized. Transitioning
@@ -539,7 +631,7 @@ impl NativeWindow {
       WindowState::Minimized => {}
       _ => {
         if self.is_minimized()? || self.is_maximized()? {
-          self.restore()?;
+          self.restore_to_position(rect)?;
         }
       }
     }
@@ -548,12 +640,6 @@ impl NativeWindow {
       | SWP_NOCOPYBITS
       | SWP_NOSENDCHANGING
       | SWP_ASYNCWINDOWPOS;
-
-    // Whether to show or hide the window.
-    match is_visible {
-      true => swp_flags |= SWP_SHOWWINDOW,
-      false => swp_flags |= SWP_HIDEWINDOW,
-    };
 
     // Whether the window should be shown above all other windows.
     let z_order = match state {
@@ -566,12 +652,6 @@ impl NativeWindow {
 
     match state {
       WindowState::Minimized => {
-        if !is_visible {
-          self.hide()?;
-        } else {
-          self.show()?;
-        }
-
         if !self.is_minimized()? {
           self.minimize()?;
         }
@@ -630,7 +710,8 @@ impl NativeWindow {
       }
     };
 
-    Ok(())
+    // Whether to hide or show the window.
+    self.set_visible(is_visible, hide_method)
   }
 }
 

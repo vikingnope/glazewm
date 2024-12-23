@@ -4,7 +4,7 @@ use tracing::{info, warn};
 use crate::{
   app_command::InvokeCommand,
   containers::traits::{CommonGetters, TilingSizeGetters},
-  user_config::{ParsedConfig, UserConfig, WindowRuleEvent},
+  user_config::{HideMethod, ParsedConfig, UserConfig, WindowRuleEvent},
   windows::{commands::run_window_rules, traits::WindowGetters},
   wm_event::WmEvent,
   wm_state::WmState,
@@ -34,6 +34,26 @@ pub fn reload_config(
   update_container_gaps(state, config);
 
   update_window_effects(&old_config, state, config)?;
+
+  // Ensure all windows are shown when hide method is changed.
+  if old_config.general.hide_method != config.value.general.hide_method
+    && config.value.general.hide_method == HideMethod::Cloak
+  {
+    for window in state.windows() {
+      let _ = window.native().show();
+    }
+  }
+
+  // Ensure all windows are shown in taskbar when `show_all_in_taskbar` is
+  // changed.
+  if old_config.general.show_all_in_taskbar
+    != config.value.general.show_all_in_taskbar
+    && config.value.general.show_all_in_taskbar
+  {
+    for window in state.windows() {
+      let _ = window.native().set_taskbar_visibility(true);
+    }
+  }
 
   // Clear active binding modes.
   state.binding_modes = Vec::new();
@@ -119,7 +139,6 @@ fn update_container_gaps(state: &mut WmState, config: &UserConfig) {
   let tiling_containers = state
     .root_container
     .self_and_descendants()
-    .into_iter()
     .filter_map(|container| container.as_tiling_container().ok());
 
   for container in tiling_containers {

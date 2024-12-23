@@ -54,6 +54,9 @@ pub struct WmState {
   /// `ignore` command.
   pub ignored_windows: Vec<NativeWindow>,
 
+  /// Whether the WM is paused.
+  pub is_paused: bool,
+
   /// Whether the initial state has been populated.
   has_initialized: bool,
 
@@ -98,6 +101,7 @@ impl WmState {
       unmanaged_or_minimized_timestamp: None,
       binding_modes: Vec::new(),
       ignored_windows: Vec::new(),
+      is_paused: false,
       has_initialized: false,
       event_tx,
       exit_tx,
@@ -187,7 +191,7 @@ impl WmState {
     native_window: &NativeWindow,
   ) -> Option<Monitor> {
     self
-      .monitor_from_native(&Platform::nearest_monitor(&native_window))
+      .monitor_from_native(&Platform::nearest_monitor(native_window))
       .or(self.monitors().first().cloned())
   }
 
@@ -300,7 +304,7 @@ impl WmState {
         self
           .recent_workspace_name
           .as_ref()
-          .and_then(|name| self.workspace_by_name(&name)),
+          .and_then(|name| self.workspace_by_name(name)),
       ),
       WorkspaceTarget::NextActive => {
         let active_workspaces = self.sorted_workspaces(config);
@@ -426,11 +430,12 @@ impl WmState {
 
   /// Emits a WM event through an MSPC channel.
   ///
-  /// Does not emit events while the WM is populating initial state. This
-  /// is to prevent events (e.g. workspace activation events) from being
-  /// emitted via IPC server before the initial state is prepared.
+  /// Does not emit events while the WM is paused or populating initial
+  /// state. This is to prevent events (e.g. workspace activation events)
+  /// from being emitted via IPC server before the initial state is
+  /// prepared.
   pub fn emit_event(&self, event: WmEvent) {
-    if self.has_initialized {
+    if self.has_initialized && !self.is_paused {
       if let Err(err) = self.event_tx.send(event) {
         warn!("Failed to send event: {}", err);
       }
@@ -446,7 +451,6 @@ impl WmState {
     self
       .root_container
       .self_and_descendants()
-      .into_iter()
       .find(|container| container.id() == id)
   }
 
@@ -474,12 +478,12 @@ impl WmState {
       .iter()
       .filter_map(|descendant| descendant.as_window_container().ok())
       .find(|descendant| {
-        match (descendant.state(), removed_window.state()) {
-          (WindowState::Tiling, WindowState::Tiling) => true,
-          (WindowState::Floating(_), WindowState::Floating(_)) => true,
-          (WindowState::Fullscreen(_), WindowState::Fullscreen(_)) => true,
-          _ => false,
-        }
+        matches!(
+          (descendant.state(), removed_window.state()),
+          (WindowState::Tiling, WindowState::Tiling)
+            | (WindowState::Floating(_), WindowState::Floating(_))
+            | (WindowState::Fullscreen(_), WindowState::Fullscreen(_))
+        )
       })
       .map(Into::into);
 
@@ -498,14 +502,17 @@ impl WmState {
       .or(Some(workspace.into()))
   }
 
-  pub fn containers_at_point(&self, point: &Point) -> Vec<Container> {
-    self
-      .root_container
+  pub fn containers_at_point(
+    &self,
+    origin_container: Container,
+    point: &Point,
+  ) -> Vec<Container> {
+    origin_container
       .descendants()
       .filter(|descendant| {
         descendant
           .to_rect()
-          .map(|frame| frame.contains_point(&point))
+          .map(|frame| frame.contains_point(point))
           .unwrap_or(false)
       })
       .collect()
@@ -520,11 +527,13 @@ impl WmState {
         Container::Monitor(monitor) => Some(monitor),
         _ => None,
       })
-      .filter(|c| {
+      .find(|c| {
         let frame = c.to_rect();
-        frame.unwrap().contains_point(&position)
+        frame
+          .ok()
+          .map(|frame| frame.contains_point(position))
+          .unwrap_or(false)
       })
-      .next()
   }
 }
 

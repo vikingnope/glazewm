@@ -11,7 +11,8 @@ use crate::{
     Container, WindowContainer,
   },
   user_config::{
-    CornerStyle, CursorJumpTrigger, UserConfig, WindowEffectConfig,
+    CornerStyle, CursorJumpTrigger, HideMethod, UserConfig,
+    WindowEffectConfig,
   },
   windows::traits::WindowGetters,
   wm_event::WmEvent,
@@ -22,8 +23,15 @@ pub fn platform_sync(
   state: &mut WmState,
   config: &UserConfig,
 ) -> anyhow::Result<()> {
-  if state.pending_sync.containers_to_redraw.len() > 0 {
-    redraw_containers(state)?;
+  // Skip platform sync when the WM is paused.
+  if state.is_paused {
+    // Clear containers to redraw to avoid leaking memory.
+    state.pending_sync.containers_to_redraw.clear();
+    return Ok(());
+  }
+
+  if !state.pending_sync.containers_to_redraw.is_empty() {
+    redraw_containers(state, config)?;
     state.pending_sync.containers_to_redraw.clear();
   }
 
@@ -106,7 +114,10 @@ fn sync_focus(
   Ok(())
 }
 
-fn redraw_containers(state: &mut WmState) -> anyhow::Result<()> {
+fn redraw_containers(
+  state: &mut WmState,
+  config: &UserConfig,
+) -> anyhow::Result<()> {
   for window in &state.windows_to_redraw() {
     let workspace =
       window.workspace().context("Window has no workspace.")?;
@@ -129,18 +140,32 @@ fn redraw_containers(state: &mut WmState) -> anyhow::Result<()> {
       .to_rect()?
       .apply_delta(&window.total_border_delta()?, None);
 
-    let is_visible = match window.display_state() {
-      DisplayState::Showing | DisplayState::Shown => true,
-      _ => false,
-    };
+    let is_visible = matches!(
+      window.display_state(),
+      DisplayState::Showing | DisplayState::Shown
+    );
 
     if let Err(err) = window.native().set_position(
       &window.state(),
       &rect,
       is_visible,
+      &config.value.general.hide_method,
       window.has_pending_dpi_adjustment(),
     ) {
       warn!("Failed to set window position: {}", err);
+    }
+
+    // Skip setting taskbar visibility if the window is hidden (has no
+    // effect). Since cloaked windows are normally always visible in the
+    // taskbar, we only need to set visibility if `show_all_in_taskbar` is
+    // `false`.
+    if config.value.general.hide_method == HideMethod::Cloak
+      && !config.value.general.show_all_in_taskbar
+    {
+      if let Err(err) = window.native().set_taskbar_visibility(is_visible)
+      {
+        warn!("Failed to set taskbar visibility: {}", err);
+      }
     }
   }
 

@@ -10,7 +10,7 @@ use crate::{
   common::{
     commands::{
       cycle_focus, disable_binding_mode, enable_binding_mode,
-      reload_config, shell_exec,
+      reload_config, shell_exec, toggle_pause,
     },
     Direction, LengthValue, RectDelta, TilingDirection,
   },
@@ -26,7 +26,8 @@ use crate::{
   windows::{
     commands::{
       ignore_window, move_window_in_direction, move_window_to_workspace,
-      resize_window, set_window_size, update_window_state,
+      resize_window, set_window_position, set_window_size,
+      update_window_state, WindowPositionTarget,
     },
     traits::WindowGetters,
     WindowState,
@@ -38,7 +39,7 @@ use crate::{
   },
 };
 
-const VERSION: &'static str = env!("VERSION_NUMBER");
+const VERSION: &str = env!("VERSION_NUMBER");
 
 #[derive(Clone, Debug, Parser)]
 #[clap(author, version = VERSION, about, long_about = None)]
@@ -155,6 +156,8 @@ pub enum QueryCommand {
   Windows,
   /// Outputs all active workspaces.
   Workspaces,
+  /// Outputs whether the window manager is paused.
+  Paused,
 }
 
 #[derive(Clone, Debug, PartialEq, ValueEnum)]
@@ -175,6 +178,7 @@ pub enum SubscribableEvent {
   WorkspaceActivated,
   WorkspaceDeactivated,
   WorkspaceUpdated,
+  PauseChanged,
 }
 
 #[derive(Clone, Debug, Parser, PartialEq, Serialize)]
@@ -188,6 +192,7 @@ pub enum InvokeCommand {
     #[clap(long)]
     direction: Direction,
   },
+  Position(InvokePositionCommand),
   Resize(InvokeResizeCommand),
   SetFloating {
     #[clap(long, default_missing_value = "true", require_equals = true, num_args = 0..=1)]
@@ -195,6 +200,18 @@ pub enum InvokeCommand {
 
     #[clap(long, default_missing_value = "true", require_equals = true, num_args = 0..=1)]
     centered: Option<bool>,
+
+    #[clap(long, allow_hyphen_values = true)]
+    x_pos: Option<i32>,
+
+    #[clap(long, allow_hyphen_values = true)]
+    y_pos: Option<i32>,
+
+    #[clap(long, allow_hyphen_values = true)]
+    width: Option<LengthValue>,
+
+    #[clap(long, allow_hyphen_values = true)]
+    height: Option<LengthValue>,
   },
   SetFullscreen {
     #[clap(long, default_missing_value = "true", require_equals = true, num_args = 0..=1)]
@@ -210,6 +227,9 @@ pub enum InvokeCommand {
     visibility: TitleBarVisibility,
   },
   ShellExec {
+    #[clap(long, action)]
+    hide_window: bool,
+
     #[clap(required = true, trailing_var_arg = true)]
     command: Vec<String>,
   },
@@ -254,6 +274,7 @@ pub enum InvokeCommand {
   WmExit,
   WmRedraw,
   WmReloadConfig,
+  WmTogglePause,
 }
 
 impl InvokeCommand {
@@ -427,6 +448,26 @@ impl InvokeCommand {
           config,
         )
       }
+      InvokeCommand::Position(args) => {
+        match subject_container.as_window_container() {
+          Ok(window) => match args.centered {
+            true => set_window_position(
+              window,
+              WindowPositionTarget::Centered,
+              state,
+            ),
+            false => set_window_position(
+              window,
+              WindowPositionTarget::Coordinates(
+                args.x_pos.clone(),
+                args.y_pos.clone(),
+              ),
+              state,
+            ),
+          },
+          _ => Ok(()),
+        }
+      }
       InvokeCommand::Resize(args) => {
         match subject_container.as_window_container() {
           Ok(window) => resize_window(
@@ -441,21 +482,56 @@ impl InvokeCommand {
       InvokeCommand::SetFloating {
         centered,
         shown_on_top,
+        x_pos,
+        y_pos,
+        width,
+        height,
       } => match subject_container.as_window_container() {
         Ok(window) => {
           let floating_defaults =
             &config.value.window_behavior.state_defaults.floating;
+          let centered = centered.unwrap_or(floating_defaults.centered);
 
-          update_window_state(
+          let window = update_window_state(
             window.clone(),
             WindowState::Floating(FloatingStateConfig {
-              centered: centered.unwrap_or(floating_defaults.centered),
+              centered,
               shown_on_top: shown_on_top
                 .unwrap_or(floating_defaults.shown_on_top),
             }),
             state,
             config,
           )?;
+
+          // Allow size and position to be set if window has not previously
+          // been manually placed.
+          if !window.has_custom_floating_placement() {
+            if width.is_some() || height.is_some() {
+              set_window_size(
+                window.clone(),
+                width.clone(),
+                height.clone(),
+                state,
+              )?;
+            }
+
+            if centered {
+              set_window_position(
+                window,
+                WindowPositionTarget::Centered,
+                state,
+              )?;
+            } else if x_pos.is_some() || y_pos.is_some() {
+              set_window_position(
+                window,
+                WindowPositionTarget::Coordinates(
+                  x_pos.clone(),
+                  y_pos.clone(),
+                ),
+                state,
+              )?;
+            }
+          }
 
           Ok(())
         }
@@ -519,20 +595,17 @@ impl InvokeCommand {
         match subject_container.as_window_container() {
           Ok(window) => {
             _ = window.native().set_title_bar_visibility(
-              if *visibility == TitleBarVisibility::Shown {
-                true
-              } else {
-                false
-              },
+              *visibility == TitleBarVisibility::Shown,
             );
             Ok(())
           }
           _ => Ok(()),
         }
       }
-      InvokeCommand::ShellExec { command } => {
-        shell_exec(&command.join(" "))
-      }
+      InvokeCommand::ShellExec {
+        hide_window,
+        command,
+      } => shell_exec(&command.join(" "), *hide_window),
       InvokeCommand::Size(args) => {
         match subject_container.as_window_container() {
           Ok(window) => set_window_size(
@@ -552,18 +625,27 @@ impl InvokeCommand {
           let floating_defaults =
             &config.value.window_behavior.state_defaults.floating;
 
+          let centered = centered.unwrap_or(floating_defaults.centered);
           let target_state = WindowState::Floating(FloatingStateConfig {
-            centered: centered.unwrap_or(floating_defaults.centered),
+            centered,
             shown_on_top: shown_on_top
               .unwrap_or(floating_defaults.shown_on_top),
           });
 
-          update_window_state(
+          let window = update_window_state(
             window.clone(),
             window.toggled_state(target_state, config),
             state,
             config,
           )?;
+
+          if !window.has_custom_floating_placement() && centered {
+            set_window_position(
+              window,
+              WindowPositionTarget::Centered,
+              state,
+            )?;
+          }
 
           Ok(())
         }
@@ -662,6 +744,7 @@ impl InvokeCommand {
         Ok(())
       }
       InvokeCommand::WmReloadConfig => reload_config(state, config),
+      InvokeCommand::WmTogglePause => toggle_pause(state),
     }
   }
 
@@ -800,4 +883,17 @@ pub struct InvokeResizeCommand {
 
   #[clap(long, allow_hyphen_values = true)]
   height: Option<LengthValue>,
+}
+
+#[derive(Args, Clone, Debug, PartialEq, Serialize)]
+#[group(required = true, multiple = true)]
+pub struct InvokePositionCommand {
+  #[clap(long, action)]
+  centered: bool,
+
+  #[clap(long, allow_hyphen_values = true)]
+  x_pos: Option<i32>,
+
+  #[clap(long, allow_hyphen_values = true)]
+  y_pos: Option<i32>,
 }

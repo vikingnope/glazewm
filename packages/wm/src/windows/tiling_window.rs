@@ -8,7 +8,8 @@ use anyhow::Context;
 use uuid::Uuid;
 
 use super::{
-  traits::WindowGetters, NonTilingWindow, WindowDto, WindowState,
+  traits::WindowGetters, InsertionTarget, NonTilingWindow, WindowDto,
+  WindowState,
 };
 use crate::{
   common::{
@@ -45,6 +46,7 @@ struct TilingWindowInner {
   border_delta: RectDelta,
   has_pending_dpi_adjustment: bool,
   floating_placement: Rect,
+  has_custom_floating_placement: bool,
   gaps_config: GapsConfig,
   done_window_rules: Vec<WindowRuleConfig>,
   active_drag: Option<ActiveDrag>,
@@ -57,12 +59,13 @@ impl TilingWindow {
     prev_state: Option<WindowState>,
     border_delta: RectDelta,
     floating_placement: Rect,
+    has_custom_floating_placement: bool,
     gaps_config: GapsConfig,
     done_window_rules: Vec<WindowRuleConfig>,
     active_drag: Option<ActiveDrag>,
   ) -> Self {
     let window = TilingWindowInner {
-      id: id.unwrap_or_else(|| Uuid::new_v4()),
+      id: id.unwrap_or_else(Uuid::new_v4),
       parent: None,
       children: VecDeque::new(),
       child_focus_order: VecDeque::new(),
@@ -74,6 +77,7 @@ impl TilingWindow {
       border_delta,
       has_pending_dpi_adjustment: false,
       floating_placement,
+      has_custom_floating_placement,
       gaps_config,
       done_window_rules,
       active_drag,
@@ -85,7 +89,7 @@ impl TilingWindow {
   pub fn to_non_tiling(
     &self,
     state: WindowState,
-    insertion_target: Option<(Container, usize)>,
+    insertion_target: Option<InsertionTarget>,
   ) -> NonTilingWindow {
     NonTilingWindow::new(
       Some(self.id()),
@@ -95,6 +99,7 @@ impl TilingWindow {
       self.border_delta(),
       insertion_target,
       self.floating_placement(),
+      self.has_custom_floating_placement(),
       self.done_window_rules(),
       self.active_drag(),
     )
